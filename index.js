@@ -1,111 +1,174 @@
-// index.js — Lumina Home (CommonJS)
+// index.js — Lumina Fulfillment (Render-ready)
+
 const express = require("express");
 const bodyParser = require("body-parser");
-const dotenv = require("dotenv");
+const mqtt = require("mqtt");
 
-dotenv.config();
 const app = express();
 app.use(bodyParser.json());
 
-// ====== صفحات اختبار بسيطة ======
-app.get("/", (_req, res) => res.send("Lumina Home: OK"));
-app.get("/callback", (req, res) => {
-  const { code, state } = req.query;
-  res.send(`<h3>OAuth Callback</h3><p>code=${code || ""}</p><p>state=${state || ""}</p>`);
-});
+// ====== بيئة التشغيل ======
+const PORT = process.env.PORT || 3000;
+const MQTT_URL  = process.env.MQTT_URL  || "";
+const MQTT_USER = process.env.MQTT_USER || "";
+const MQTT_PASS = process.env.MQTT_PASS || "";
 
-// ====== OAuth /authorize: صفحة واضحة بزر ======
-app.get("/authorize", (req, res) => {
-  const { client_id, redirect_uri, state } = req.query;
-  if (!redirect_uri) return res.status(400).send("missing redirect_uri");
-  if (client_id && client_id !== "client123") return res.status(400).send("invalid client_id");
+// ====== MQTT ======
+let mqttClient = null;
+if (MQTT_URL) {
+  try {
+    mqttClient = mqtt.connect(MQTT_URL, {
+      username: MQTT_USER,
+      password: MQTT_PASS,
+      reconnectPeriod: 3000,
+    });
 
-  const code = "demo-code";
-  const target =
-    redirect_uri +
-    (redirect_uri.includes("?") ? "&" : "?") +
-    `code=${encodeURIComponent(code)}${state ? `&state=${encodeURIComponent(state)}` : ""}`;
-
-  res.type("html").send(`<!doctype html><meta charset="utf-8"/>
-  <h2>Lumina Home – Sign in</h2>
-  <p>ستُعاد إلى: <code>${target}</code></p>
-  <a href="${target}" style="padding:10px 16px;border:1px solid #0a7;border-radius:8px;text-decoration:none;font-weight:700">متابعة</a>`);
-});
-
-// ====== OAuth /token ======
-app.post("/token", (req, res) => {
-  const { grant_type } = req.body || {};
-  if (grant_type === "authorization_code") {
-    return res.json({ token_type: "bearer", access_token: "demo-access-token", refresh_token: "demo-refresh-token", expires_in: 3600 });
+    mqttClient.on("connect", () => console.log("[MQTT] Connected"));
+    mqttClient.on("error", (err) => console.log("[MQTT] Error:", err?.message || err));
+  } catch (e) {
+    console.log("[MQTT] connect exception:", e?.message || e);
   }
-  if (grant_type === "refresh_token") {
-    return res.json({ token_type: "bearer", access_token: "demo-access-token-" + Date.now(), expires_in: 3600 });
-  }
-  return res.json({ token_type: "bearer", access_token: "demo-access-token", expires_in: 3600 });
-});
+}
 
-// ====== قاعدة أجهزة تجريبية ======
-const devices = [
-  {
+// ====== DB بسيطة للأجهزة ======
+const devicesDB = {
+  "dev-kitchen-1": {
     id: "dev-kitchen-1",
     type: "action.devices.types.SWITCH",
     traits: ["action.devices.traits.OnOff"],
-    name: { name: "Kitchen Switch" },
-    willReportState: false,
+    name: "Kitchen Switch",
     roomHint: "Kitchen",
-    state: { on: false, online: true },
+    willReportState: false,
+    states: { on: false },
+    // topic اختياري لو أردت نشر أوامر MQTT
+    mqttTopic: "home/kitchen/switch",
   },
-];
-const byId = (id) => devices.find((d) => d.id === id);
+};
 
-// ====== /smarthome (intent موحّد) ======
-app.post("/smarthome", (req, res) => {
-  console.log("[/smarthome] got:", JSON.stringify(req.body, null, 2));
-  const requestId = req.body?.requestId || "req";
-  const intent = req.body?.inputs?.[0]?.intent;
+// ====== صفحات مساعدة ======
+app.get("/", (_req, res) => {
+  res.type("text/plain").send("Lumina Fulfillment is running ✅");
+});
+app.get("/health", (_req, res) => res.status(200).send("ok"));
 
-  if (intent === "action.devices.SYNC") {
-    const payload = {
-      agentUserId: "user-123",
-      devices: devices.map(({ id, type, traits, name, willReportState, roomHint }) => ({
-        id, type, traits, name, willReportState, roomHint
-      })),
-    };
-    return res.json({ requestId, payload });
+// ====== OAuth 2.0 (تبسيطي للاختبار) ======
+// Google سيرسل إليك: response_type, client_id, redirect_uri, state, scope
+app.get("/authorize", (req, res) => {
+  const { redirect_uri, state = "" } = req.query;
+
+  // في الإنتاج، اعرض شاشة تسجيل الدخول؛ هنا نعيد توجيه فوريًا مع code تجريبي
+  if (redirect_uri) {
+    const code = "demo-code";
+    const uri = new URL(redirect_uri);
+    uri.searchParams.set("code", code);
+    uri.searchParams.set("state", state);
+    return res.redirect(uri.toString());
   }
 
-  if (intent === "action.devices.QUERY") {
-    const ids = req.body.inputs[0].payload.devices.map((d) => d.id);
-    const result = {};
-    ids.forEach((id) => { const d = byId(id); if (d) result[id] = d.state; });
-    return res.json({ requestId, payload: { devices: result } });
-  }
-
-  if (intent === "action.devices.EXECUTE") {
-    const cmds = req.body.inputs[0].payload.commands || [];
-    const results = [];
-    for (const c of cmds) {
-      const ids = c.devices.map((d) => d.id);
-      for (const ex of c.execution) {
-        if (ex.command === "action.devices.commands.OnOff") {
-          const desired = !!ex.params.on;
-          ids.forEach((id) => {
-            const d = byId(id);
-            if (!d) return;
-            d.state.on = desired;
-            d.state.online = true;
-            results.push({ ids: [id], status: "SUCCESS", states: d.state });
-          });
-        } else {
-          results.push({ ids, status: "ERROR", errorCode: "notSupported" });
-        }
-      }
-    }
-    return res.json({ requestId, payload: { commands: results } });
-  }
-
-  return res.status(400).json({ requestId, error: "unknown_intent" });
+  // للزيارة اليدوية
+  res.type("html").send(`
+    <h2>OAuth Authorize (demo)</h2>
+    <p>هذه صفحة تجريبية. يجب أن تُستدعى من Google مع redirect_uri.</p>
+  `);
 });
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Fulfillment server running on http://localhost:${port}\n[/smarthome] handler ready`));
+// Google يستبدل code بـ access_token
+app.post("/token", (req, res) => {
+  // في الواقع تتحقق من client_id/secret و code. هنا نرجّع توكن تجريبي.
+  res.json({
+    token_type: "bearer",
+    access_token: "test-access-token",
+    refresh_token: "test-refresh-token",
+    expires_in: 3600,
+  });
+});
+
+// ====== Smart Home Fulfillment ======
+app.post("/smarthome", async (req, res) => {
+  console.log("=== /smarthome body ===");
+  console.log(JSON.stringify(req.body, null, 2));
+
+  const { requestId, inputs = [] } = req.body || {};
+  const intent = inputs[0]?.intent || "";
+
+  try {
+    if (intent.endsWith(".SYNC")) {
+      // رجّع الأجهزة
+      const device = devicesDB["dev-kitchen-1"];
+      return res.json({
+        requestId,
+        payload: {
+          agentUserId: "user-123",
+          devices: [
+            {
+              id: device.id,
+              type: device.type,
+              traits: device.traits,
+              name: { name: device.name },
+              roomHint: device.roomHint,
+              willReportState: device.willReportState,
+            },
+          ],
+        },
+      });
+    }
+
+    if (intent.endsWith(".QUERY")) {
+      const devs = inputs[0]?.payload?.devices || [];
+      const out = {};
+      for (const d of devs) {
+        const dev = devicesDB[d.id];
+        if (dev) out[d.id] = { online: true, on: !!dev.states.on };
+      }
+      return res.json({ requestId, payload: { devices: out } });
+    }
+
+    if (intent.endsWith(".EXECUTE")) {
+      const cmds = inputs[0]?.payload?.commands || [];
+      const results = [];
+      for (const group of cmds) {
+        for (const exec of group.execution || []) {
+          if (exec.command === "action.devices.commands.OnOff") {
+            const newOn = !!exec.params.on;
+            for (const t of group.devices || []) {
+              const dev = devicesDB[t.id];
+              if (!dev) continue;
+              dev.states.on = newOn;
+              // نشر MQTT (اختياري)
+              if (mqttClient && dev.mqttTopic) {
+                try { mqttClient.publish(dev.mqttTopic, newOn ? "ON" : "OFF"); } catch {}
+              }
+              results.push({
+                ids: [dev.id],
+                status: "SUCCESS",
+                states: { online: true, on: dev.states.on },
+              });
+            }
+          }
+        }
+      }
+      return res.json({ requestId, payload: { commands: results } });
+    }
+
+    // أي Intent غير مدعوم
+    return res.json({ requestId, payload: {} });
+  } catch (e) {
+    console.log("smarthome error:", e?.message || e);
+    return res.status(500).json({ requestId, payload: { errorCode: "internalError" } });
+  }
+});
+
+// ====== callback للاختبار اليدوي فقط ======
+app.get("/callback", (req, res) => {
+  const { code, state } = req.query;
+  res.type("html").send(`
+    <h2>OAuth Callback</h2>
+    <p><b>code</b>: ${code || ""}</p>
+    <p><b>state</b>: ${state || ""}</p>
+  `);
+});
+
+// ====== تشغيل ======
+app.listen(PORT, () => {
+  console.log(`Fulfillment server running on :${PORT}`);
+});

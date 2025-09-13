@@ -190,5 +190,12 @@ app.post("/smarthome", async (req, res) => {
   }
 });
 
+app.get('/debug-env', (req, res) => {
+  res.json({
+    TEST_USER_ID: process.env.TEST_USER_ID || null,
+    hasAuthHeader: !!req.headers.authorization
+  });
+});
+
 // ===== Start =====
 app.listen(PORT, () => console.log(`Fulfillment server running on :${PORT}`));

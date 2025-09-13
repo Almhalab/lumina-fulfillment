@@ -1,4 +1,4 @@
-// index.js — Lumina Fulfillment (Supabase + Google Home) — STEP 1
+// index.js — Lumina Fulfillment (Render + Supabase) — STEP 1 (TEST_USER_ID)
 
 const express = require("express");
 const bodyParser = require("body-parser");
@@ -9,23 +9,23 @@ const app = express();
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
-// ===== Env =====
+/* ========= ENV ========= */
 const PORT = process.env.PORT || 3000;
 
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE || "";
-const TEST_USER_ID = process.env.TEST_USER_ID || null; // مؤقتًا للاختبار
+const TEST_USER_ID = process.env.TEST_USER_ID || null; // مؤقت للاختبار
 
 const MQTT_URL  = process.env.MQTT_URL  || "";
 const MQTT_USER = process.env.MQTT_USER || "";
 const MQTT_PASS = process.env.MQTT_PASS || "";
 
-// ===== Supabase (admin) =====
+/* ========= Supabase (admin) ========= */
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, {
   auth: { persistSession: false },
 });
 
-// ===== MQTT (اختياري) =====
+/* ========= MQTT (اختياري) ========= */
 let mqttClient = null;
 if (MQTT_URL) {
   mqttClient = mqtt.connect(MQTT_URL, {
@@ -37,17 +37,30 @@ if (MQTT_URL) {
   mqttClient.on("error", (e) => console.log("[MQTT] Error:", e?.message || e));
 }
 
-// ===== Helpers =====
-function getAgentUserId(_req) {
-  // لاحقًا سنستبدله بقراءة userId من توكن الربط (Step 2)
-  return TEST_USER_ID;
+/* ========= Helpers ========= */
+function getAgentUserId(req) {
+  // أولوية للاختبار: إذا تم ضبط TEST_USER_ID نستخدمه مباشرة بدون Authorization
+  if (TEST_USER_ID && TEST_USER_ID.trim().length > 0) return TEST_USER_ID.trim();
+
+  // لاحقًا (Step 2) سنقرأ من Authorization: Bearer <token> ونحوّل إلى userId
+  const auth = req.headers.authorization || "";
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  if (!m) return null;
+  // TODO: تحقق التوكن واسترجع userId
+  return null;
 }
 
-// ===== Health =====
+/* ========= Health & Debug ========= */
 app.get("/", (_req, res) => res.send("Lumina Fulfillment is running ✅"));
 app.get("/health", (_req, res) => res.send("ok"));
+app.get("/debug-env", (req, res) => {
+  res.json({
+    TEST_USER_ID: TEST_USER_ID || null,
+    hasAuthHeader: !!req.headers.authorization,
+  });
+});
 
-// ===== Unified Smart Home endpoint =====
+/* ========= Google Smart Home (موحّد) ========= */
 app.post("/smarthome", async (req, res) => {
   console.log("=== /smarthome body ===");
   console.log(JSON.stringify(req.body, null, 2));
@@ -56,16 +69,15 @@ app.post("/smarthome", async (req, res) => {
   const intent = inputs[0]?.intent || "";
 
   try {
-    // -------- SYNC --------
+    /* ----- SYNC ----- */
     if (intent.endsWith(".SYNC")) {
       const userId = getAgentUserId(req);
       if (!userId) {
         return res.status(401).json({ error: "unauthorized" });
       }
 
-      // اجلب أجهزة هذا المستخدم فقط من جدول devices لديك
-      // الأعمدة حسب تعريفك في موبايلك:
-      // id, user_id, name, room_key, conn_type, topic_cmd, topic_state, ...
+      // من جدول devices حسب سكيمتك في الموبايل:
+      // id, user_id, name, room_key, conn_type, topic_cmd, topic_state ...
       const { data: rows, error } = await supabase
         .from("devices")
         .select("id, name, room_key, conn_type, topic_cmd, topic_state")
@@ -86,7 +98,7 @@ app.post("/smarthome", async (req, res) => {
         roomHint: d.room_key || undefined,
         willReportState: false,
         attributes: {},
-        // بيانات إضافية مفيدة لنا لاحقًا
+        // نرسل بيانات إضافية قد نحتاجها لاحقًا
         customData: {
           connType: d.conn_type || null,
           topicCmd: d.topic_cmd || null,
@@ -100,18 +112,18 @@ app.post("/smarthome", async (req, res) => {
       });
     }
 
-    // -------- QUERY --------
+    /* ----- QUERY ----- */
     if (intent.endsWith(".QUERY")) {
       const asked = inputs[0]?.payload?.devices || [];
       const result = {};
-      // إن لم يكن عندك جدول حالة، رجّع حالة افتراضية
+      // إن لم يكن لديك جدول حالة، نرجّع حالة افتراضية
       for (const dev of asked) {
-        result[dev.id] = { online: true, on: false };
+        result[String(dev.id)] = { online: true, on: false };
       }
       return res.json({ requestId, payload: { devices: result } });
     }
 
-    // -------- EXECUTE --------
+    /* ----- EXECUTE ----- */
     if (intent.endsWith(".EXECUTE")) {
       const userId = getAgentUserId(req);
       if (!userId) {
@@ -124,7 +136,7 @@ app.post("/smarthome", async (req, res) => {
       for (const group of commands) {
         const ids = (group.devices || []).map((d) => String(d.id));
 
-        // تأكد أن الأجهزة مملوكة للمستخدم
+        // تأكيد ملكية الأجهزة للمستخدم
         const { data: owned, error: ownErr } = await supabase
           .from("devices")
           .select("id, topic_cmd")
@@ -150,7 +162,7 @@ app.post("/smarthome", async (req, res) => {
                 continue;
               }
 
-              // انشر MQTT إذا لديك topic_cmd
+              // نشر MQTT إذا كان topic_cmd موجود
               const topic = ownedMap.get(id)?.topic_cmd;
               if (mqttClient && topic) {
                 try {
@@ -164,7 +176,7 @@ app.post("/smarthome", async (req, res) => {
                 }
               }
 
-              // رجّع الحالة مباشرة (حتى لو ما عندنا جدول device_state)
+              // نرجّع الحالة مباشرة (حتى بدون تخزين state)
               results.push({
                 ids: [id],
                 status: "SUCCESS",
@@ -180,7 +192,7 @@ app.post("/smarthome", async (req, res) => {
       return res.json({ requestId, payload: { commands: results } });
     }
 
-    // -------- غير مدعوم --------
+    /* ----- Intent غير مدعوم ----- */
     return res.json({ requestId, payload: {} });
   } catch (e) {
     console.log("smarthome error:", e?.message || e);
@@ -190,12 +202,5 @@ app.post("/smarthome", async (req, res) => {
   }
 });
 
-app.get('/debug-env', (req, res) => {
-  res.json({
-    TEST_USER_ID: process.env.TEST_USER_ID || null,
-    hasAuthHeader: !!req.headers.authorization
-  });
-});
-
-// ===== Start =====
+/* ========= Start ========= */
 app.listen(PORT, () => console.log(`Fulfillment server running on :${PORT}`));

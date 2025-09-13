@@ -6,10 +6,11 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
+    "@supabase/supabase-js": "^2.57.4",
     "body-parser": "^1.20.2",
-    "mqtt": "^5.3.4",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "mqtt": "^5.3.4"
   },
   "engines": {
     "node": ">=18"

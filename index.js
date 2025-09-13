@@ -1,174 +1,250 @@
-// index.js — Lumina Fulfillment (Render-ready)
-
+// index.js — Lumina Fulfillment (Render + Supabase)
 const express = require("express");
 const bodyParser = require("body-parser");
 const mqtt = require("mqtt");
+const jwt = require("jsonwebtoken");
+const { v4: uuidv4 } = require("uuid");
+const { createClient } = require("@supabase/supabase-js");
 
 const app = express();
 app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: true })); // يدعم x-www-form-urlencoded
 
-// ====== بيئة التشغيل ======
+// ===== Env =====
 const PORT = process.env.PORT || 3000;
+const SUPABASE_URL = process.env.SUPABASE_URL || "";
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || "";
+const JWT_SECRET = process.env.JWT_SECRET || "dev-secret";
+
 const MQTT_URL  = process.env.MQTT_URL  || "";
 const MQTT_USER = process.env.MQTT_USER || "";
 const MQTT_PASS = process.env.MQTT_PASS || "";
 
-// ====== MQTT ======
+// ===== Supabase =====
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+
+// ===== MQTT =====
 let mqttClient = null;
 if (MQTT_URL) {
-  try {
-    mqttClient = mqtt.connect(MQTT_URL, {
-      username: MQTT_USER,
-      password: MQTT_PASS,
-      reconnectPeriod: 3000,
-    });
-
-    mqttClient.on("connect", () => console.log("[MQTT] Connected"));
-    mqttClient.on("error", (err) => console.log("[MQTT] Error:", err?.message || err));
-  } catch (e) {
-    console.log("[MQTT] connect exception:", e?.message || e);
-  }
+  mqttClient = mqtt.connect(MQTT_URL, {
+    username: MQTT_USER,
+    password: MQTT_PASS,
+    reconnectPeriod: 2000,
+  });
+  mqttClient.on("connect", () => {
+    console.log("[MQTT] Connected");
+    // استقبل حالات جميع الأجهزة (topic نمطي)
+    mqttClient.subscribe("lumina/+/state");
+  });
+  mqttClient.on("error", (e) => console.log("[MQTT] Error:", e?.message || e));
+  mqttClient.on("message", async (topic, msg) => {
+    try {
+      const m = topic.match(/^lumina\/(.+)\/state$/);
+      if (!m) return;
+      const id = m[1]; // device id
+      const payload = JSON.parse(msg.toString());
+      // حدّث state في Supabase
+      await supabase
+        .from("devices")
+        .update({ state: { on: !!payload.on, online: true } })
+        .eq("id", id);
+      console.log("[STATE] updated", id, payload);
+    } catch (e) {
+      console.log("[MQTT parse error]", e?.message || e);
+    }
+  });
 }
 
-// ====== DB بسيطة للأجهزة ======
-const devicesDB = {
-  "dev-kitchen-1": {
-    id: "dev-kitchen-1",
-    type: "action.devices.types.SWITCH",
-    traits: ["action.devices.traits.OnOff"],
-    name: "Kitchen Switch",
-    roomHint: "Kitchen",
-    willReportState: false,
-    states: { on: false },
-    // topic اختياري لو أردت نشر أوامر MQTT
-    mqttTopic: "home/kitchen/switch",
-  },
-};
+// ===== صفحات فحص بسيطة =====
+app.get("/", (_req, res) => res.send("Lumina Fulfillment is running ✅"));
+app.get("/health", (_req, res) => res.send("ok"));
 
-// ====== صفحات مساعدة ======
-app.get("/", (_req, res) => {
-  res.type("text/plain").send("Lumina Fulfillment is running ✅");
-});
-app.get("/health", (_req, res) => res.status(200).send("ok"));
+// ===== OAuth (مبسّط للاختبار) =====
+// نخزّن مؤقتًا: code -> userId
+const authCodes = new Map();
 
-// ====== OAuth 2.0 (تبسيطي للاختبار) ======
-// Google سيرسل إليك: response_type, client_id, redirect_uri, state, scope
+/**
+ * /authorize: ارجع code مربوط بمستخدمك.
+ * مبدئيًا نعيد userId ثابت للاختبار. لاحقًا وصّلها بتسجيل الدخول الفعلي.
+ */
 app.get("/authorize", (req, res) => {
   const { redirect_uri, state = "" } = req.query;
+  if (!redirect_uri) return res.status(400).send("missing redirect_uri");
 
-  // في الإنتاج، اعرض شاشة تسجيل الدخول؛ هنا نعيد توجيه فوريًا مع code تجريبي
-  if (redirect_uri) {
-    const code = "demo-code";
-    const uri = new URL(redirect_uri);
-    uri.searchParams.set("code", code);
-    uri.searchParams.set("state", state);
-    return res.redirect(uri.toString());
-  }
+  // TODO: بدّل هذا بمعرّف المستخدم الحقيقي من نظامك
+  const userId = "user-123";
 
-  // للزيارة اليدوية
-  res.type("html").send(`
-    <h2>OAuth Authorize (demo)</h2>
-    <p>هذه صفحة تجريبية. يجب أن تُستدعى من Google مع redirect_uri.</p>
-  `);
+  const code = uuidv4();
+  authCodes.set(code, userId);
+
+  const url = new URL(redirect_uri);
+  url.searchParams.set("code", code);
+  if (state) url.searchParams.set("state", state);
+  return res.redirect(url.toString());
 });
 
-// Google يستبدل code بـ access_token
+/**
+ * /token: تبادل code -> access_token (JWT يحتوي sub=userId)
+ * يقبل JSON أو x-www-form-urlencoded
+ */
 app.post("/token", (req, res) => {
-  // في الواقع تتحقق من client_id/secret و code. هنا نرجّع توكن تجريبي.
-  res.json({
+  const code = req.body.code || req.query.code;
+  const userId = authCodes.get(code);
+  if (!userId) return res.status(400).json({ error: "invalid_grant" });
+
+  const access_token = jwt.sign({ sub: userId }, JWT_SECRET, { expiresIn: "24h" });
+  // اختياري: إصدار refresh_token وتخزينه
+  return res.json({
     token_type: "bearer",
-    access_token: "test-access-token",
-    refresh_token: "test-refresh-token",
-    expires_in: 3600,
+    access_token,
+    expires_in: 86400,
+    refresh_token: "demo-refresh-token",
   });
 });
 
-// ====== Smart Home Fulfillment ======
-app.post("/smarthome", async (req, res) => {
+// ===== Middleware لاستخراج userId من Authorization: Bearer <JWT> =====
+function authMiddleware(req, res, next) {
+  try {
+    const h = req.headers.authorization || "";
+    const token = h.startsWith("Bearer ") ? h.slice(7) : null;
+    if (!token) throw new Error("no token");
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.userId = decoded.sub;
+    next();
+  } catch (e) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+}
+
+// ===== Smart Home: endpoint موحّد =====
+app.post("/smarthome", authMiddleware, async (req, res) => {
   console.log("=== /smarthome body ===");
   console.log(JSON.stringify(req.body, null, 2));
 
   const { requestId, inputs = [] } = req.body || {};
   const intent = inputs[0]?.intent || "";
+  const userId = req.userId;
 
   try {
+    // ---- SYNC ----
     if (intent.endsWith(".SYNC")) {
-      // رجّع الأجهزة
-      const device = devicesDB["dev-kitchen-1"];
+      const { data, error } = await supabase
+        .from("devices")
+        .select("*")
+        .eq("owner", userId);
+
+      if (error) throw error;
+
+      const devices = (data || []).map((d) => ({
+        id: d.id,
+        type: d.type,
+        traits: d.traits,
+        name: { name: d.name },
+        roomHint: d.room_hint || undefined,
+        willReportState: false, // فعّل لاحقًا مع Google HomeGraph
+      }));
+
       return res.json({
         requestId,
-        payload: {
-          agentUserId: "user-123",
-          devices: [
-            {
-              id: device.id,
-              type: device.type,
-              traits: device.traits,
-              name: { name: device.name },
-              roomHint: device.roomHint,
-              willReportState: device.willReportState,
-            },
-          ],
-        },
+        payload: { agentUserId: userId, devices },
       });
     }
 
+    // ---- QUERY ----
     if (intent.endsWith(".QUERY")) {
-      const devs = inputs[0]?.payload?.devices || [];
-      const out = {};
-      for (const d of devs) {
-        const dev = devicesDB[d.id];
-        if (dev) out[d.id] = { online: true, on: !!dev.states.on };
-      }
-      return res.json({ requestId, payload: { devices: out } });
+      const ids = inputs[0]?.payload?.devices?.map((d) => d.id) || [];
+      if (ids.length === 0) return res.json({ requestId, payload: { devices: {} } });
+
+      const { data, error } = await supabase
+        .from("devices")
+        .select("id,state")
+        .eq("owner", userId)
+        .in("id", ids);
+
+      if (error) throw error;
+
+      const result = {};
+      (data || []).forEach((d) => {
+        result[d.id] = {
+          online: !!d.state?.online,
+          on: !!d.state?.on,
+        };
+      });
+
+      return res.json({ requestId, payload: { devices: result } });
     }
 
+    // ---- EXECUTE ----
     if (intent.endsWith(".EXECUTE")) {
-      const cmds = inputs[0]?.payload?.commands || [];
+      const commands = inputs[0]?.payload?.commands || [];
       const results = [];
-      for (const group of cmds) {
-        for (const exec of group.execution || []) {
-          if (exec.command === "action.devices.commands.OnOff") {
-            const newOn = !!exec.params.on;
-            for (const t of group.devices || []) {
-              const dev = devicesDB[t.id];
-              if (!dev) continue;
-              dev.states.on = newOn;
-              // نشر MQTT (اختياري)
-              if (mqttClient && dev.mqttTopic) {
-                try { mqttClient.publish(dev.mqttTopic, newOn ? "ON" : "OFF"); } catch {}
+
+      for (const c of commands) {
+        const ids = (c.devices || []).map((d) => d.id);
+        // تأكيد الملكية
+        const { data: owned, error: ownErr } = await supabase
+          .from("devices")
+          .select("id,topics")
+          .eq("owner", userId)
+          .in("id", ids);
+        if (ownErr) throw ownErr;
+
+        const ownedSet = new Set((owned || []).map((x) => x.id));
+        const topicsById = {};
+        (owned || []).forEach((x) => (topicsById[x.id] = x.topics || {}));
+
+        for (const ex of c.execution || []) {
+          if (ex.command === "action.devices.commands.OnOff") {
+            const isOn = !!ex.params?.on;
+            for (const id of ids) {
+              if (!ownedSet.has(id)) {
+                results.push({ ids: [id], status: "ERROR", errorCode: "deviceNotFound" });
+                continue;
               }
+              // نشر MQTT
+              const topic = topicsById[id]?.set || `lumina/${id}/set`;
+              if (mqttClient) {
+                try {
+                  mqttClient.publish(topic, JSON.stringify({ on: isOn }), { qos: 1 });
+                } catch {}
+              }
+              // تحديث الحالة في DB
+              await supabase
+                .from("devices")
+                .update({ state: { on: isOn, online: true } })
+                .eq("id", id)
+                .eq("owner", userId);
+
               results.push({
-                ids: [dev.id],
+                ids: [id],
                 status: "SUCCESS",
-                states: { online: true, on: dev.states.on },
+                states: { on: isOn, online: true },
               });
             }
+          } else {
+            results.push({ ids, status: "ERROR", errorCode: "notSupported" });
           }
         }
       }
+
       return res.json({ requestId, payload: { commands: results } });
     }
 
-    // أي Intent غير مدعوم
+    // غير مدعوم
     return res.json({ requestId, payload: {} });
   } catch (e) {
-    console.log("smarthome error:", e?.message || e);
+    console.error("smarthome error:", e?.message || e);
     return res.status(500).json({ requestId, payload: { errorCode: "internalError" } });
   }
 });
 
-// ====== callback للاختبار اليدوي فقط ======
+// ===== OAuth callback للاختبار اليدوي =====
 app.get("/callback", (req, res) => {
   const { code, state } = req.query;
-  res.type("html").send(`
-    <h2>OAuth Callback</h2>
-    <p><b>code</b>: ${code || ""}</p>
-    <p><b>state</b>: ${state || ""}</p>
-  `);
+  res.type("html").send(
+    `<h2>OAuth Callback</h2><p><b>code:</b> ${code || ""}</p><p><b>state:</b> ${state || ""}</p>`
+  );
 });
 
-// ====== تشغيل ======
-app.listen(PORT, () => {
-  console.log(`Fulfillment server running on :${PORT}`);
-});
+// ===== Start =====
+app.listen(PORT, () => console.log(`Fulfillment server running on :${PORT}`));

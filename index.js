@@ -1,206 +1,143 @@
-// index.js — Lumina Fulfillment (Render + Supabase) — STEP 1 (TEST_USER_ID)
-
-const express = require("express");
-const bodyParser = require("body-parser");
-const mqtt = require("mqtt");
-const { createClient } = require("@supabase/supabase-js");
+// ----- Basic server -----
+const express = require('express');
+const morgan = require('morgan');
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
+app.use(express.json());
+app.use(morgan('dev'));
 
-/* ========= ENV ========= */
+// ----- Env -----
 const PORT = process.env.PORT || 3000;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE || process.env.SUPABASE_ANON_KEY;
+const AUTH_BEARER = process.env.AUTH_BEARER;         // أي نص قوي (للاختبار)
+const TEST_USER_ID = process.env.TEST_USER_ID;       // UUID = قيمة owner من جدول devices
 
-const SUPABASE_URL = process.env.SUPABASE_URL || "";
-const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE || "";
-const TEST_USER_ID = process.env.TEST_USER_ID || null; // مؤقت للاختبار
-
-const MQTT_URL  = process.env.MQTT_URL  || "";
-const MQTT_USER = process.env.MQTT_USER || "";
-const MQTT_PASS = process.env.MQTT_PASS || "";
-
-/* ========= Supabase (admin) ========= */
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE, {
-  auth: { persistSession: false },
-});
-
-/* ========= MQTT (اختياري) ========= */
-let mqttClient = null;
-if (MQTT_URL) {
-  mqttClient = mqtt.connect(MQTT_URL, {
-    username: MQTT_USER,
-    password: MQTT_PASS,
-    reconnectPeriod: 2000,
-  });
-  mqttClient.on("connect", () => console.log("[MQTT] Connected"));
-  mqttClient.on("error", (e) => console.log("[MQTT] Error:", e?.message || e));
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+  console.error('❌ Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE/SUPABASE_ANON_KEY env vars');
+  process.exit(1);
 }
 
-/* ========= Helpers ========= */
-function getAgentUserId(req) {
-  // أولوية للاختبار: إذا تم ضبط TEST_USER_ID نستخدمه مباشرة بدون Authorization
-  if (TEST_USER_ID && TEST_USER_ID.trim().length > 0) return TEST_USER_ID.trim();
+// خذ service-role للمخدم إن توفر (أفضل للسيرفر)
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
+  auth: { persistSession: false }
+});
 
-  // لاحقًا (Step 2) سنقرأ من Authorization: Bearer <token> ونحوّل إلى userId
-  const auth = req.headers.authorization || "";
-  const m = auth.match(/^Bearer\s+(.+)$/i);
-  if (!m) return null;
-  // TODO: تحقق التوكن واسترجع userId
+// ===== Helpers =====
+function getUserIdFromRequest(req) {
+  // في الإنتاج تربطه بـ OAuth. الآن للاختبار بـ Bearer + TEST_USER_ID
+  const auth = req.headers.authorization || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  if (token && AUTH_BEARER && token === AUTH_BEARER && TEST_USER_ID) {
+    return TEST_USER_ID;
+  }
   return null;
 }
 
-/* ========= Health & Debug ========= */
-app.get("/", (_req, res) => res.send("Lumina Fulfillment is running ✅"));
-app.get("/health", (_req, res) => res.send("ok"));
-app.get("/debug-env", (req, res) => {
+function mapDeviceToGoogle(d) {
+  // غيّر حسب موديلاتك لو تحتاج Traits أخرى
+  return {
+    id: d.id,
+    type: 'action.devices.types.SWITCH',
+    traits: ['action.devices.traits.OnOff'],
+    name: { name: d.name || d.id },
+    deviceInfo: { model: d.model || 'switch-1' },
+    willReportState: false,
+  };
+}
+
+// ===== Test/ops endpoints =====
+app.get('/', (req, res) => res.send('Lumina fulfillment alive'));
+app.get('/ping', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
+app.get('/healthz', (req, res) => res.status(200).send('ok'));
+app.get('/debug-env', (req, res) => {
   res.json({
-    TEST_USER_ID: TEST_USER_ID || null,
-    hasAuthHeader: !!req.headers.authorization,
+    hasUrl: !!SUPABASE_URL,
+    hasKey: !!SUPABASE_KEY,
+    hasAuthBearer: !!AUTH_BEARER,
+    hasTestUser: !!TEST_USER_ID,
+    node: process.version
   });
 });
 
-/* ========= Google Smart Home (موحّد) ========= */
-app.post("/smarthome", async (req, res) => {
-  console.log("=== /smarthome body ===");
-  console.log(JSON.stringify(req.body, null, 2));
-
-  const { requestId, inputs = [] } = req.body || {};
-  const intent = inputs[0]?.intent || "";
-
+// ===== Google Smart Home endpoint =====
+app.post('/smarthome', async (req, res) => {
   try {
-    /* ----- SYNC ----- */
-    if (intent.endsWith(".SYNC")) {
-      const userId = getAgentUserId(req);
-      if (!userId) {
-        return res.status(401).json({ error: "unauthorized" });
-      }
+    const requestId = req.body.requestId || `${Date.now()}`;
+    const inputs = req.body.inputs || [];
+    const intent = inputs[0]?.intent;
 
-      // من جدول devices حسب سكيمتك في الموبايل:
-      // id, user_id, name, room_key, conn_type, topic_cmd, topic_state ...
+    const userId = getUserIdFromRequest(req);
+    if (!userId) {
+      return res.status(401).json({ error: 'Unauthorized', hint: 'Missing/invalid Bearer or TEST_USER_ID' });
+    }
+
+    // SYNC: رجع كل أجهزة المستخدم من جدول devices حيث owner = userId
+    if (intent === 'action.devices.SYNC') {
       const { data: rows, error } = await supabase
-        .from("devices")
-        .select("id, name, room_key, conn_type, topic_cmd, topic_state")
-        .eq("user_id", userId);
+        .from('devices')
+        .select('*')
+        .eq('owner', userId);
 
-      if (error) {
-        console.log("[DB] SYNC error:", error.message);
-        return res
-          .status(500)
-          .json({ requestId, payload: { errorCode: "internalError" } });
-      }
+      if (error) throw error;
 
-      const devices = (rows || []).map((d) => ({
-        id: String(d.id),
-        type: "action.devices.types.SWITCH",
-        traits: ["action.devices.traits.OnOff"],
-        name: { name: d.name || "Device" },
-        roomHint: d.room_key || undefined,
-        willReportState: false,
-        attributes: {},
-        // نرسل بيانات إضافية قد نحتاجها لاحقًا
-        customData: {
-          connType: d.conn_type || null,
-          topicCmd: d.topic_cmd || null,
-          topicState: d.topic_state || null,
-        },
-      }));
+      const devices = (rows || []).map(mapDeviceToGoogle);
 
       return res.json({
         requestId,
-        payload: { agentUserId: userId, devices },
+        payload: {
+          agentUserId: userId,
+          devices
+        }
       });
     }
 
-    /* ----- QUERY ----- */
-    if (intent.endsWith(".QUERY")) {
-      const asked = inputs[0]?.payload?.devices || [];
-      const result = {};
-      // إن لم يكن لديك جدول حالة، نرجّع حالة افتراضية
-      for (const dev of asked) {
-        result[String(dev.id)] = { online: true, on: false };
+    // QUERY: رجّع حالة الأجهزة المطلوبة (مثال مبسّط—كلها offline false و on افتراضيًا false)
+    if (intent === 'action.devices.QUERY') {
+      const deviceIds = inputs[0]?.payload?.devices?.map(d => d.id) || [];
+      const { data: rows, error } = await supabase
+        .from('devices')
+        .select('id, owner')
+        .in('id', deviceIds)
+        .eq('owner', userId);
+
+      if (error) throw error;
+
+      const out = {};
+      for (const d of rows || []) {
+        out[d.id] = { online: true, on: false }; // غيّر حسب حالة جهازك الحقيقية إن كانت محفوظة
       }
-      return res.json({ requestId, payload: { devices: result } });
+
+      return res.json({ requestId, payload: { devices: out } });
     }
 
-    /* ----- EXECUTE ----- */
-    if (intent.endsWith(".EXECUTE")) {
-      const userId = getAgentUserId(req);
-      if (!userId) {
-        return res.status(401).json({ error: "unauthorized" });
-      }
-
+    // EXECUTE: نفّذ أوامر (مثال on/off فقط بدون MQTT فعلي هنا)
+    if (intent === 'action.devices.EXECUTE') {
       const commands = inputs[0]?.payload?.commands || [];
+      // هنا يمكنك إشعال MQTT أو REST لأجهزتك ثم تحدّث device_state في DB
       const results = [];
-
-      for (const group of commands) {
-        const ids = (group.devices || []).map((d) => String(d.id));
-
-        // تأكيد ملكية الأجهزة للمستخدم
-        const { data: owned, error: ownErr } = await supabase
-          .from("devices")
-          .select("id, topic_cmd")
-          .eq("user_id", userId)
-          .in("id", ids);
-
-        if (ownErr) {
-          console.log("[DB] OWN error:", ownErr.message);
-        }
-        const ownedMap = new Map((owned || []).map((r) => [String(r.id), r]));
-
-        for (const exec of group.execution || []) {
-          if (exec.command === "action.devices.commands.OnOff") {
-            const isOn = !!exec.params?.on;
-
-            for (const id of ids) {
-              if (!ownedMap.has(id)) {
-                results.push({
-                  ids: [id],
-                  status: "ERROR",
-                  errorCode: "deviceNotFound",
-                });
-                continue;
-              }
-
-              // نشر MQTT إذا كان topic_cmd موجود
-              const topic = ownedMap.get(id)?.topic_cmd;
-              if (mqttClient && topic) {
-                try {
-                  mqttClient.publish(
-                    topic,
-                    JSON.stringify({ on: isOn }),
-                    { qos: 1 }
-                  );
-                } catch (e) {
-                  console.log("[MQTT publish error]", e?.message || e);
-                }
-              }
-
-              // نرجّع الحالة مباشرة (حتى بدون تخزين state)
-              results.push({
-                ids: [id],
-                status: "SUCCESS",
-                states: { online: true, on: isOn },
-              });
-            }
-          } else {
-            results.push({ ids, status: "ERROR", errorCode: "notSupported" });
-          }
+      for (const cmd of commands) {
+        for (const dev of cmd.devices || []) {
+          results.push({
+            ids: [dev.id],
+            status: 'SUCCESS',
+            states: { online: true } // أضف on:true/false إذا نفّذت on/off فعلاً
+          });
         }
       }
-
       return res.json({ requestId, payload: { commands: results } });
     }
 
-    /* ----- Intent غير مدعوم ----- */
+    // غير مدعوم
     return res.json({ requestId, payload: {} });
-  } catch (e) {
-    console.log("smarthome error:", e?.message || e);
-    return res
-      .status(500)
-      .json({ requestId, payload: { errorCode: "internalError" } });
+  } catch (err) {
+    console.error('smarthome error:', err);
+    return res.status(500).json({ error: String(err?.message || err) });
   }
 });
 
-/* ========= Start ========= */
-app.listen(PORT, () => console.log(`Fulfillment server running on :${PORT}`));
+// ----- start -----
+app.listen(PORT, () => {
+  console.log(`Fulfillment server running on http://localhost:${PORT}`);
+});

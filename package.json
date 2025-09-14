@@ -10,8 +10,22 @@
     "node": ">=18"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.45.0",
-    "express": "^4.19.2",
-    "morgan": "^1.10.0"
-  }
+    "@supabase/supabase-js": "^2.57.4",
+    "body-parser": "^2.2.0",
+    "express": "^4.21.2",
+    "morgan": "^1.10.1",
+    "mqtt": "^5.14.1"
+  },
+  "description": "��#\u0000 \u0000l\u0000u\u0000m\u0000i\u0000n\u0000a\u0000-\u0000f\u0000u\u0000l\u0000f\u0000i\u0000l\u0000l\u0000m\u0000e\u0000n\u0000t\u0000\r\u0000 \u0000",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Almhalab/lumina-fulfillment.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/Almhalab/lumina-fulfillment/issues"
+  },
+  "homepage": "https://github.com/Almhalab/lumina-fulfillment#readme"
 }

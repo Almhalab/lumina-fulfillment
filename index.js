@@ -1,158 +1,227 @@
-import express from "express";
-import bodyParser from "body-parser";
-import morgan from "morgan";
-import mqtt from "mqtt";
-import jwt from "jsonwebtoken";
-import dotenv from "dotenv";
-import { createClient } from "@supabase/supabase-js";
+// index.js — Lumina Fulfillment مع MQTT + Supabase + Google Smart Home
 
-dotenv.config();
+import express from 'express';
+import morgan from 'morgan';
+import bodyParser from 'body-parser';
+import { createClient } from '@supabase/supabase-js';
+import mqtt from 'mqtt';
+
+/* ========= ENV ========= */
+const {
+  PORT = 3000,
+  AUTH_BEARER = 'test-secret-123',
+  TEST_USER_ID,
+
+  SUPABASE_URL,
+  SUPABASE_SERVICE_ROLE,
+
+  MQTT_URL,
+  MQTT_USER,
+  MQTT_PASS,
+} = process.env;
+
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE) {
+  console.error('❌ Missing SUPABASE_URL / SUPABASE_SERVICE_ROLE');
+  process.exit(1);
+}
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE);
 const app = express();
-const PORT = process.env.PORT || 10000;
-
-/** ================= إعداد Supabase ================= */
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_KEY;
-const supabase = createClient(supabaseUrl, supabaseKey);
-
-/** ================= إعداد MQTT ================= */
-const mqttClient = mqtt.connect(process.env.MQTT_URL, {
-  username: process.env.MQTT_USER,
-  password: process.env.MQTT_PASS,
-});
-
-mqttClient.on("connect", () => {
-  console.log("[MQTT] connected");
-});
-
-mqttClient.on("error", (err) => {
-  console.error("[MQTT] error:", err.message);
-});
-
-/** ================= إعداد Express ================= */
-app.use(morgan("dev"));
+app.use(morgan('tiny'));
 app.use(bodyParser.json());
 
-/** ================= OAuth: /authorize ================= */
-app.get("/authorize", (req, res) => {
-  const { client_id, redirect_uri, state, app_token } = req.query;
+/* ========= Google traits ========= */
+const MODEL_MAP = {
+  'switch-1': {
+    type: 'action.devices.types.SWITCH',
+    traits: ['action.devices.traits.OnOff'],
+  },
+};
+function modelToTraits(model) {
+  return MODEL_MAP[model] || {
+    type: 'action.devices.types.SWITCH',
+    traits: ['action.devices.traits.OnOff'],
+  };
+}
 
-  if (!client_id || !redirect_uri) {
-    return res.status(400).send("Missing client_id or redirect_uri");
-  }
+/* ========= MQTT Client ========= */
+let mqttClient = null;
 
-  // هنا نتحقق من المستخدم (من تطبيقك أو Supabase)
-  let userId = "demo-user";
-  try {
-    const decoded = jwt.decode(app_token);
-    if (decoded?.sub) userId = decoded.sub;
-  } catch (e) {
-    console.warn("No valid app_token, fallback demo-user");
-  }
-
-  const code = jwt.sign({ userId }, process.env.JWT_SECRET || "secret", {
-    expiresIn: "10m",
+if (MQTT_URL) {
+  mqttClient = mqtt.connect(MQTT_URL, {
+    username: MQTT_USER,
+    password: MQTT_PASS,
+    reconnectPeriod: 3000,
+    connectTimeout: 15_000,
   });
 
-  const redirectUrl = `${redirect_uri}?code=${code}&state=${state}`;
-  res.redirect(302, redirectUrl);
+  mqttClient.on('connect', () => {
+    console.log('[MQTT] connected');
+    mqttClient.subscribe('lumina/+/state', { qos: 0 });
+  });
+
+  mqttClient.on('message', async (topic, payloadBuf) => {
+    try {
+      const msg = payloadBuf.toString().trim();
+      const m = /^lumina\/([^/]+)\/state$/.exec(topic);
+      if (!m) return;
+      const deviceId = m[1];
+
+      let on = null;
+      try {
+        const j = JSON.parse(msg);
+        if (typeof j?.power === 'boolean') on = j.power;
+      } catch {
+        if (msg.toLowerCase() === 'on') on = true;
+        else if (msg.toLowerCase() === 'off') on = false;
+      }
+
+      if (on !== null) {
+        await supabase.from('device_state').upsert(
+          {
+            device_id: deviceId,
+            on,
+            online: true,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: 'device_id' }
+        );
+      }
+    } catch (e) {
+      console.error('[MQTT] message error:', e?.message || e);
+    }
+  });
+}
+
+/* ========= Helpers ========= */
+function requireBearer(req, res, next) {
+  const got = (req.headers.authorization || '').trim();
+  if (!got || got !== `Bearer ${AUTH_BEARER}`) {
+    return res.status(401).json({ ok: false, error: 'Unauthorized' });
+  }
+  next();
+}
+
+async function fetchUserDevices(owner) {
+  const { data, error } = await supabase
+    .from('devices')
+    .select('id, name, model')
+    .eq('owner', owner)
+    .order('created_at', { ascending: true });
+  if (error) throw error;
+  return data || [];
+}
+
+async function fetchDevicesState(ids) {
+  if (!ids.length) return {};
+  const { data, error } = await supabase
+    .from('device_state')
+    .select('device_id, on, online')
+    .in('device_id', ids);
+  if (error) throw error;
+  const map = {};
+  for (const row of data || []) {
+    map[row.device_id] = { online: !!row.online, on: !!row.on, status: 'SUCCESS' };
+  }
+  return map;
+}
+
+async function upsertDeviceState(id, on) {
+  await supabase.from('device_state').upsert(
+    { device_id: id, on: !!on, online: true, updated_at: new Date().toISOString() },
+    { onConflict: 'device_id' }
+  );
+}
+
+function publishMqtt(topic, message) {
+  return new Promise((resolve, reject) => {
+    if (!mqttClient || !mqttClient.connected) return reject(new Error('MQTT not connected'));
+    mqttClient.publish(topic, message, { qos: 0, retain: false }, (err) => {
+      if (err) reject(err);
+      else resolve(true);
+    });
+  });
+}
+
+/* ========= Diagnostics ========= */
+app.get('/', (_req, res) => res.type('text').send('Lumina Fulfillment – OK'));
+app.get('/health', (_req, res) => res.json({ ok: true, time: new Date().toISOString() }));
+app.get('/debug-env', (_req, res) => {
+  res.json({
+    AUTH_BEARER_SET: !!AUTH_BEARER,
+    TEST_USER_ID,
+    has_SUPABASE_URL: !!SUPABASE_URL,
+    has_SUPABASE_SERVICE_ROLE: !!SUPABASE_SERVICE_ROLE,
+    has_MQTT_URL: !!MQTT_URL,
+    mqtt_connected: !!(mqttClient && mqttClient.connected),
+  });
 });
 
-/** ================= OAuth: /token ================= */
-app.post("/token", (req, res) => {
-  const { code } = req.body;
+/* ========= Smart Home Fulfillment ========= */
+app.post('/smarthome', requireBearer, async (req, res) => {
   try {
-    const decoded = jwt.verify(code, process.env.JWT_SECRET || "secret");
-    const accessToken = jwt.sign(
-      { userId: decoded.userId },
-      process.env.JWT_SECRET || "secret",
-      { expiresIn: "1h" }
-    );
+    const requestId = req.body?.requestId || `${Date.now()}`;
+    const input = (req.body?.inputs || [])[0] || {};
+    const intent = input.intent;
+    const owner = TEST_USER_ID;
 
-    res.json({
-      token_type: "bearer",
-      access_token: accessToken,
-      expires_in: 3600,
-    });
-  } catch (err) {
-    res.status(400).json({ error: "invalid_grant" });
-  }
-});
-
-/** ================= Fulfillment: /smarthome ================= */
-app.post("/smarthome", async (req, res) => {
-  const intent = req.body.inputs?.[0]?.intent;
-  const requestId = req.body.requestId || "123";
-
-  if (intent === "action.devices.SYNC") {
-    return res.json({
-      requestId,
-      payload: {
-        agentUserId: "demo-user",
-        devices: [
-          {
-            id: "SW-N1-00001",
-            type: "action.devices.types.SWITCH",
-            traits: ["action.devices.traits.OnOff"],
-            name: {
-              defaultNames: ["switch-1"],
-              name: "SW-N1-00001",
-              nicknames: ["switch-1"],
-            },
-            willReportState: false,
-            deviceInfo: {
-              manufacturer: "Lumina",
-              model: "switch-1",
-            },
+    if (intent === 'action.devices.SYNC') {
+      const rows = await fetchUserDevices(owner);
+      const devices = rows.map((r) => {
+        const meta = modelToTraits(r.model);
+        return {
+          id: r.id,
+          type: meta.type,
+          traits: meta.traits,
+          name: {
+            defaultNames: [r.model || 'switch'],
+            name: r.name || r.id,
+            nicknames: [r.name || r.id],
           },
-        ],
-      },
-    });
+          willReportState: false,
+          deviceInfo: { manufacturer: 'Lumina', model: r.model || 'switch-1' },
+        };
+      });
+      return res.json({ requestId, payload: { agentUserId: owner, devices } });
+    }
+
+    if (intent === 'action.devices.QUERY') {
+      const ids = (input.payload?.devices || []).map((d) => d.id);
+      const states = await fetchDevicesState(ids);
+      return res.json({ requestId, payload: { devices: states } });
+    }
+
+    if (intent === 'action.devices.EXECUTE') {
+      const results = [];
+      for (const group of input.payload?.commands || []) {
+        const ids = (group.devices || []).map((d) => d.id);
+        const ex = (group.execution || []).find((e) => e.command === 'action.devices.commands.OnOff');
+        if (!ex) {
+          results.push({ ids, status: 'ERROR', errorCode: 'notSupported' });
+          continue;
+        }
+        const desiredOn = !!ex.params?.on;
+        for (const id of ids) {
+          try {
+            if (mqttClient && mqttClient.connected) {
+              await publishMqtt(`lumina/${id}/cmd`, desiredOn ? 'on' : 'off');
+            }
+            await upsertDeviceState(id, desiredOn);
+            results.push({ ids: [id], status: 'SUCCESS', states: { online: true, on: desiredOn } });
+          } catch {
+            results.push({ ids: [id], status: 'ERROR', errorCode: 'hardError' });
+          }
+        }
+      }
+      return res.json({ requestId, payload: { commands: results } });
+    }
+
+    return res.status(400).json({ requestId, error: 'Unsupported intent' });
+  } catch (e) {
+    console.error('Fulfillment error:', e);
+    return res.status(500).json({ error: 'internal', message: String(e?.message || e) });
   }
-
-  if (intent === "action.devices.QUERY") {
-    return res.json({
-      requestId,
-      payload: {
-        devices: {
-          "SW-N1-00001": { online: true, on: false, status: "SUCCESS" },
-        },
-      },
-    });
-  }
-
-  if (intent === "action.devices.EXECUTE") {
-    const command =
-      req.body.inputs[0].payload.commands[0].execution[0].command;
-    const params =
-      req.body.inputs[0].payload.commands[0].execution[0].params;
-
-    let on = params.on;
-    mqttClient.publish("lumina/switch/1/set", on ? "ON" : "OFF");
-
-    return res.json({
-      requestId,
-      payload: {
-        commands: [
-          {
-            ids: ["SW-N1-00001"],
-            status: "SUCCESS",
-            states: { on, online: true },
-          },
-        ],
-      },
-    });
-  }
-
-  res.json({ requestId, payload: {} });
 });
 
-/** ================= اختبار ================= */
-app.get("/", (req, res) => {
-  res.send("✅ Lumina Fulfillment is running!");
-});
-
-/** ================= تشغيل السيرفر ================= */
-app.listen(PORT, () => {
-  console.log(`✅ Fulfillment server running on :${PORT}`);
-});
+/* ========= Start ========= */
+app.listen(PORT, () => console.log(`✅ Fulfillment server running on :${PORT}`));

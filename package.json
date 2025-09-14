@@ -1,15 +1,14 @@
 {
   "name": "lumina-fulfillment",
   "version": "1.0.0",
-  "private": true,
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "body-parser": "^1.20.2",
-    "express": "^4.19.2",
-    "morgan": "^1.10.0"
+    "@supabase/supabase-js": "^2.57.4",
+    "express": "^4.21.2",
+    "morgan": "^1.10.1"
   }
 }

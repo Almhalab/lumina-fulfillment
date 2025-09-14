@@ -2,14 +2,19 @@
   "name": "lumina-fulfillment",
   "version": "1.0.0",
   "type": "module",
+  "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "build": "echo \"no build step\""
+  },
+  "engines": {
+    "node": ">=18 <23"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
-    "body-parser": "^1.20.3",
+    "body-parser": "^1.20.2",
     "express": "^4.19.2",
     "morgan": "^1.10.0",
-    "mqtt": "^5.10.0"
+    "mqtt": "^5.7.0"
   }
 }

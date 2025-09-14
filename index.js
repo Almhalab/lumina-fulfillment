@@ -219,3 +219,94 @@ app.post('/smarthome', requireBearer, async (req, res) => {
 
 /* ========= Start ========= */
 app.listen(PORT, () => console.log(`Fulfillment server running on :${PORT}`));
+
+// ====== OAuth (بسيط للاختبار) ======
+const OAUTH_CLIENT_ID = process.env.OAUTH_CLIENT_ID || 'secret123';
+
+// تخزين مؤقت في الذاكرة
+const authCodes = new Map();   // code -> { userId, exp }
+const accessTokens = new Map();// token -> { userId, exp }
+
+// مساعد: توليد نص عشوائي قصير
+const rnd = (len = 32) => [...crypto.getRandomValues(new Uint8Array(len))]
+  .map(b => ('0' + b.toString(16)).slice(-2)).join('');
+
+// صفحة موافقة بسيطة
+app.get('/authorize', (req, res) => {
+  const { client_id, redirect_uri, response_type, state } = req.query;
+
+  if (client_id !== OAUTH_CLIENT_ID || response_type !== 'code' || !redirect_uri) {
+    return res.status(400).send('invalid authorize request');
+  }
+
+  // المستخدم الحقيقي عندك معروف (مسجّل في التطبيق) — حالياً نستعمل TEST_USER_ID
+  const userId = TEST_USER_ID;
+  const code = rnd(16);
+  const exp = Date.now() + 5 * 60 * 1000; // 5 دقائق
+
+  authCodes.set(code, { userId, exp });
+
+  // صفحة HTML خفيفة مع زر "ربط"
+  res.type('html').send(`
+<!doctype html><meta charset="utf-8">
+<title>ربط حساب Lumina</title>
+<style>body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:40px}</style>
+<h3>ربط حساب Lumina مع Google Home</h3>
+<p>سيتم ربط الحساب للمستخدم: <code>${userId}</code></p>
+<form method="GET" action="${redirect_uri}">
+  <input type="hidden" name="code" value="${code}">
+  <input type="hidden" name="state" value="${state || ''}">
+  <button type="submit" style="padding:10px 16px;border-radius:8px;background:#111;color:#fff;border:none">
+    ربط
+  </button>
+</form>
+  `);
+});
+
+// تبادل code -> token
+app.post('/token', express.urlencoded({ extended: false }), (req, res) => {
+  const { grant_type, code, client_id, redirect_uri } = req.body || {};
+
+  if (client_id !== OAUTH_CLIENT_ID) {
+    return res.status(400).json({ error: 'invalid_client' });
+  }
+  if (grant_type !== 'authorization_code' || !code) {
+    return res.status(400).json({ error: 'unsupported_grant_type' });
+  }
+
+  const saved = authCodes.get(code);
+  if (!saved || saved.exp < Date.now()) {
+    return res.status(400).json({ error: 'invalid_grant' });
+  }
+  authCodes.delete(code);
+
+  const token = rnd(24);
+  const exp = Date.now() + 3600 * 1000; // 1 ساعة
+  accessTokens.set(token, { userId: saved.userId, exp });
+
+  return res.json({
+    access_token: token,
+    token_type: 'Bearer',
+    expires_in: 3600,
+    refresh_token: rnd(24) // اختياري
+  });
+});
+
+// تعديل بسيط على فحص الـ Bearer: قبول توكنات Google أيضاً
+function requireBearer(req, res, next) {
+  const got = (req.headers.authorization || '').trim();
+  const goodTest = got === `Bearer ${AUTH_BEARER}`;
+
+  let goodGoogle = false;
+  if (got.startsWith('Bearer ')) {
+    const t = got.slice(7);
+    const rec = accessTokens.get(t);
+    if (rec && rec.exp > Date.now()) goodGoogle = true;
+  }
+
+  if (!goodTest && !goodGoogle) {
+    return res.status(401).json({ ok: false, error: 'Unauthorized' });
+  }
+  next();
+}
+

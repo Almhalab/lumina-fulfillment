@@ -1,216 +1,220 @@
-// index.js — Lumina Fulfillment (diagnostic build)
+// index.js
+import express from 'express';
+import morgan from 'morgan';
+import bodyParser from 'body-parser';
+import { createClient } from '@supabase/supabase-js';
 
-const express = require('express');
-const morgan = require('morgan');
-const { createClient } = require('@supabase/supabase-js');
+// ====== الإعدادات من المتغيرات ======
+const {
+  PORT = 3000,
+  AUTH_BEARER = 'test-secret-123',            // مفتاح بسيط لحماية /smarthome في الاختبار
+  TEST_USER_ID,                                // المعرّف التجريبي (UUID) لاختباراتك اليدوية
+  SUPABASE_URL,
+  SUPABASE_SERVICE_ROLE,                       // Service Role Key (ليس anon)
+} = process.env;
 
-const app = express();
-app.use(express.json());
-app.use(morgan('dev'));
-
-/* ====== ENV ====== */
-const PORT = process.env.PORT || 3000;
-
-// مفاتيح Supabase
-const SUPABASE_URL = process.env.SUPABASE_URL || '';
-// استخدم SERVICE_ROLE (مفضّل للسيرفر). إن لم يوجد، سيجرب ANON لكن قد تصدمك RLS.
-const SUPABASE_SERVICE_ROLE = process.env.SUPABASE_SERVICE_ROLE || '';
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || '';
-
-// المصادقة البسيطة للاختبار
-const AUTH_BEARER = process.env.AUTH_BEARER || 'test-secret-123';
-
-// المستخدم الافتراضي للاختبار (لازم يطابق devices.owner)
-const TEST_USER_ID = process.env.TEST_USER_ID || '';
-
-/* ====== Supabase Client ====== */
-const ACTIVE_SUPABASE_KEY = SUPABASE_SERVICE_ROLE || SUPABASE_ANON_KEY;
-if (!SUPABASE_URL || !ACTIVE_SUPABASE_KEY) {
-  console.warn('⚠️ Missing SUPABASE_URL or SERVICE_ROLE/ANON key — /debug-db سيشرح التفاصيل.');
+// ====== Supabase (مفتاح Service Role لأننا على السيرفر) ======
+if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE) {
+  console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE in env');
+  process.exit(1);
 }
-const supabase = (SUPABASE_URL && ACTIVE_SUPABASE_KEY)
-  ? createClient(SUPABASE_URL, ACTIVE_SUPABASE_KEY, { auth: { persistSession: false } })
-  : null;
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE);
 
-/* ====== Helpers ====== */
-function checkAuth(req, res) {
-  const auth = req.headers.authorization || '';
-  if (!auth.startsWith('Bearer ')) {
-    res.status(401).json({ error: 'Unauthorized', hint: 'Missing Bearer token' });
-    return null;
-  }
-  const token = auth.slice(7).trim();
-  if (token !== AUTH_BEARER) {
-    res.status(401).json({ error: 'Unauthorized', hint: 'Invalid Bearer token' });
-    return null;
-  }
-  return token;
-}
-
-function getOwnerId(req) {
-  // أولوية: هيدر X-User-Id إن وُجد، وإلا TEST_USER_ID من البيئة
-  return (req.headers['x-user-id'] && String(req.headers['x-user-id'])) || TEST_USER_ID || null;
-}
-
-function mapToGoogleDevice(row) {
-  return {
-    id: row.id,
+// ====== خريطة النماذج → أنواع/Traits ======
+const MODEL_MAP = {
+  'switch-1': {
     type: 'action.devices.types.SWITCH',
     traits: ['action.devices.traits.OnOff'],
-    name: { defaultNames: [row.model || 'Switch'], name: row.name || row.id, nicknames: [row.id] },
-    willReportState: false,
-    deviceInfo: { manufacturer: 'Lumina', model: row.model || 'switch-1' },
+  },
+  // أضف نماذج أخرى هنا عند الحاجة
+};
+
+const app = express();
+app.use(morgan('tiny'));
+app.use(bodyParser.json());
+
+// ====== Middleware للحماية برأس Authorization بسيط أثناء الاختبار ======
+function requireBearer(req, res, next) {
+  const got = (req.headers.authorization || '').trim();
+  if (!got || got !== `Bearer ${AUTH_BEARER}`) {
+    return res.status(401).json({ ok: false, error: 'Unauthorized' });
+  }
+  next();
+}
+
+// ====== أدوات ======
+function modelToGhome(model) {
+  return MODEL_MAP[model] || {
+    type: 'action.devices.types.SWITCH',
+    traits: ['action.devices.traits.OnOff'],
   };
 }
 
-/* ====== Diagnostics ====== */
-app.get('/', (_req, res) => res.send('Lumina fulfillment is running!'));
-app.get('/health', (_req, res) => res.json({ ok: true, time: new Date().toISOString(), node: process.version }));
-app.get('/debug-env', (req, res) => {
+async function fetchUserDevices(owner) {
+  const { data, error } = await supabase
+    .from('devices')
+    .select('id, name, model')
+    .eq('owner', owner)
+    .order('created_at', { ascending: true });
+
+  if (error) throw error;
+  return data || [];
+}
+
+async function fetchDevicesState(ids) {
+  if (!ids.length) return {};
+  const { data, error } = await supabase
+    .from('device_state')
+    .select('device_id, on')
+    .in('device_id', ids);
+
+  if (error) throw error;
+
+  const map = {};
+  for (const row of data || []) {
+    map[row.device_id] = { online: true, on: !!row.on, status: 'SUCCESS' };
+  }
+  return map;
+}
+
+async function upsertDeviceOnOff(id, on) {
+  const { error } = await supabase
+    .from('device_state')
+    .upsert(
+      { device_id: id, on: !!on, updated_at: new Date().toISOString() },
+      { onConflict: 'device_id' }
+    );
+  if (error) throw error;
+}
+
+// ====== صفحات فحص سريعة ======
+app.get('/', (_req, res) => res.type('text').send('Lumina Fulfillment – OK'));
+
+app.get('/debug-env', (_req, res) => {
   res.json({
+    hasAuthHeader: false,
+    TEST_USER_ID,
+    AUTH_BEARER_SET: !!AUTH_BEARER,
     has_SUPABASE_URL: !!SUPABASE_URL,
-    has_SERVICE_ROLE: !!SUPABASE_SERVICE_ROLE,
-    has_ANON_KEY: !!SUPABASE_ANON_KEY,
-    ACTIVE_KEY_TYPE: SUPABASE_SERVICE_ROLE ? 'service_role' : (SUPABASE_ANON_KEY ? 'anon' : 'none'),
-    AUTH_BEARER_set: !!AUTH_BEARER,
-    TEST_USER_ID: TEST_USER_ID || null,
-    hasAuthHeader: !!req.headers.authorization,
+    has_SUPABASE_SERVICE_ROLE: !!SUPABASE_SERVICE_ROLE,
   });
 });
 
-// تشخيص قاعدة البيانات مع طباعة سبب الخطأ
-app.get('/debug-db', async (req, res) => {
+app.get('/debug-env-auth', requireBearer, (_req, res) => {
+  res.json({
+    hasAuthHeader: true,
+    TEST_USER_ID,
+    AUTH_BEARER_SET: !!AUTH_BEARER,
+    has_SUPABASE_URL: !!SUPABASE_URL,
+    has_SUPABASE_SERVICE_ROLE: !!SUPABASE_SERVICE_ROLE,
+  });
+});
+
+app.get('/debug-db', requireBearer, async (_req, res) => {
   try {
-    const ownerId = req.query.owner || TEST_USER_ID || null;
-
-    if (!SUPABASE_URL || !ACTIVE_SUPABASE_KEY) {
-      return res.status(500).json({
-        ok: false,
-        error: 'Missing Supabase configuration',
-        details: {
-          has_SUPABASE_URL: !!SUPABASE_URL,
-          has_SERVICE_ROLE: !!SUPABASE_SERVICE_ROLE,
-          has_ANON_KEY: !!SUPABASE_ANON_KEY,
-        },
-      });
-    }
-    if (!ownerId) {
-      return res.status(400).json({
-        ok: false,
-        error: 'Missing owner',
-        details: 'Set TEST_USER_ID env or pass ?owner=<uuid>',
-      });
-    }
-
-    // Ping بسيط
-    const { error: pingErr } = await supabase.from('devices').select('id').limit(1);
-    if (pingErr) {
-      return res.status(500).json({
-        ok: false,
-        error: 'Ping select failed',
-        details: pingErr.message || pingErr,
-      });
-    }
-
-    // الاستعلام الفعلي
-    const { data, error, status } = await supabase
+    const owner = TEST_USER_ID; // في الإنتاج خذ المعرف الحقيقي من توكن ربط الحساب
+    const { data, error } = await supabase
       .from('devices')
-      .select('id, owner, name, model, created_at')
-      .eq('owner', ownerId)
-      .limit(50);
+      .select('id, name, model')
+      .eq('owner', owner)
+      .limit(5);
 
-    if (error) {
-      return res.status(500).json({
-        ok: false,
-        error: 'Query failed',
-        status,
-        details: error.message || error,
-      });
-    }
-
-    return res.json({ ok: true, owner: ownerId, count: (data || []).length, sample: data || [] });
+    if (error) throw error;
+    res.json({ ok: true, owner, count: data?.length || 0, sample: data || [] });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+    res.status(500).json({ ok: false, error: 'ping select failed', details: String(e?.message || e) });
   }
 });
 
-/* ====== Google Smart Home ====== */
-app.post('/smarthome', async (req, res) => {
-  const started = Date.now();
+// ====== Google Smart Home Fulfillment ======
+app.post('/smarthome', requireBearer, async (req, res) => {
   try {
-    if (!checkAuth(req, res)) return;
-
-    const { requestId, inputs } = req.body || {};
-    if (!requestId || !Array.isArray(inputs) || !inputs.length) {
-      return res.status(400).json({ error: 'Bad request: missing requestId/inputs' });
-    }
-
+    const requestId = req.body?.requestId || `${Date.now()}`;
+    const inputs = req.body?.inputs || [];
     const intent = inputs[0]?.intent;
-    const ownerId = getOwnerId(req);
-    if (!ownerId) {
-      return res.status(400).json({
-        requestId,
-        payload: { errorCode: 'missingUser', debug: 'Provide X-User-Id header or set TEST_USER_ID env' },
-      });
-    }
 
-    // ===== SYNC =====
+    // ملاحظة: في الإنتاج، استخرج userId الحقيقي من توكن OAuth
+    const owner = TEST_USER_ID;
+
+    // --- SYNC ---
     if (intent === 'action.devices.SYNC') {
-      if (!supabase) {
-        return res.status(500).json({
-          requestId,
-          payload: { errorCode: 'internalError', debug: 'Supabase client not configured' },
-        });
-      }
+      const rows = await fetchUserDevices(owner);
 
-      const { data, error } = await supabase
-        .from('devices')
-        .select('id, owner, name, model')
-        .eq('owner', ownerId);
+      const devices = rows.map((r) => {
+        const meta = modelToGhome(r.model);
+        return {
+          id: r.id,
+          type: meta.type,
+          traits: meta.traits,
+          name: {
+            defaultNames: [r.model],
+            name: r.name || r.id,
+            nicknames: [r.name || r.id],
+          },
+          willReportState: false,
+          deviceInfo: {
+            manufacturer: 'Lumina',
+            model: r.model,
+          },
+        };
+      });
 
-      if (error) {
-        console.error('[SYNC] DB error:', error.message || error);
-        return res.status(500).json({
-          requestId,
-          payload: { errorCode: 'internalError', debug: error.message || String(error) },
-        });
-      }
-
-      const devices = (data || []).map(mapToGoogleDevice);
-      return res.json({ requestId, payload: { agentUserId: ownerId, devices } });
-    }
-
-    // ===== QUERY =====
-    if (intent === 'action.devices.QUERY') {
-      const asked = inputs[0]?.payload?.devices || [];
-      const out = {};
-      for (const d of asked) {
-        // هنا ممكن تجيب الحالة من جدول device_state لو تبغى
-        out[d.id] = { online: true, on: false, status: 'SUCCESS' };
-      }
-      return res.json({ requestId, payload: { devices: out } });
-    }
-
-    // ===== EXECUTE (اختياري: stub) =====
-    if (intent === 'action.devices.EXECUTE') {
-      // نفّذ أوامر on/off … (أضف MQTT لاحقًا)
       return res.json({
         requestId,
-        payload: { commands: [{ ids: [], status: 'SUCCESS' }] },
+        payload: { agentUserId: owner, devices },
       });
+    }
+
+    // --- QUERY ---
+    if (intent === 'action.devices.QUERY') {
+      const toQuery = (inputs[0]?.payload?.devices || []).map((d) => d.id);
+      const stateMap = await fetchDevicesState(toQuery);
+
+      // أي جهاز ما له حالة نخليه online=true/on=false
+      for (const id of toQuery) {
+        if (!stateMap[id]) stateMap[id] = { online: true, on: false, status: 'SUCCESS' };
+      }
+
+      return res.json({ requestId, payload: { devices: stateMap } });
+    }
+
+    // --- COMMAND (OnOff) ---
+    if (intent === 'action.devices.COMMAND') {
+      const commands = inputs[0]?.payload?.commands || [];
+      const results = [];
+
+      for (const group of commands) {
+        const ids = (group.devices || []).map((d) => d.id);
+        for (const exec of group.execution || []) {
+          if (exec.command === 'action.devices.commands.OnOff') {
+            const on = !!exec.params?.on;
+            // نحدّث الحالة لكل جهاز
+            for (const id of ids) {
+              try {
+                // (اختياري) هنا ترسل MQTT لو جهازك MQTT
+                await upsertDeviceOnOff(id, on);
+                results.push({
+                  ids: [id],
+                  status: 'SUCCESS',
+                  states: { online: true, on },
+                });
+              } catch {
+                results.push({ ids: [id], status: 'ERROR', errorCode: 'hardError' });
+              }
+            }
+          }
+        }
+      }
+
+      return res.json({ requestId, payload: { commands: results } });
     }
 
     // Intent غير مدعوم
-    return res.json({ requestId, payload: { errorCode: 'notSupported', debug: intent } });
+    return res.status(400).json({ requestId, error: 'Unsupported intent' });
   } catch (e) {
-    console.error('SMARTHOME ERROR:', e?.message || e);
+    console.error('Fulfillment error:', e);
     return res.status(500).json({ error: 'internal', message: String(e?.message || e) });
-  } finally {
-    console.log('Handled /smarthome in', Date.now() - started, 'ms');
   }
 });
 
-/* ====== Start ====== */
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Fulfillment server running on :${PORT}`);
-});
+app.listen(PORT, () => console.log(`Fulfillment server running on :${PORT}`));
